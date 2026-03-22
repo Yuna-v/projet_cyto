@@ -1,0 +1,1664 @@
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+# Introduction
+
+This document presents a complete analysis pipeline for flow cytometry data including:
+
+- Data transformation (arcsinh)
+- Dimensionality reduction (t-SNE, UMAP)
+- Clustering analysis
+- Statistical testing between conditions
+
+---
+
+# 1. Setup and Library Loading
+
+```{r libraries}
+library(flowCore)
+library(dplyr)
+library(tidyr)
+library(Rtsne)
+library(devtools)
+library(CellVizR)
+library(ggplot2)
+library(gridExtra)
+library(tibble)
+library(lme4)
+library(lmerTest)
+
+library(pheatmap)
+library(cluster)
+library(gridExtra)
+library(cluster)
+library(mclust)
+
+
+library(flowCore)
+library(flowWorkspace)
+#library(spade)
+#library(Rtsne)
+
+library(igraph)
+library(RANN) 
+library(ggrepel)
+
+library(here)
+# Set global seed for reproducibility
+set.seed(123)
+library(tidytext)
+```
+
+---
+
+# 2. Data Import
+
+
+```{r data-import}
+data_dir <- here("Myeloid_data")
+
+fcs_files <- list.files(
+  data_dir,
+  pattern = "\\.fcs$",
+  full.names = TRUE
+)
+
+cat("Found", length(fcs_files), "FCS files\n")
+head(fcs_files)
+```
+
+
+```{r flowset-creation}
+# Create flowSet object (contains all cells, markers, and samples)
+flow_set <- read.flowSet(fcs_files)
+```
+
+---
+
+# 3. Data Transformation
+
+Apply arcsinh transformation to handle skewed intensity distributions typical in cytometry data. This transformation compresses high intensities while preserving resolution at low signals.
+
+```{r transformation}
+# Get marker names
+marker_names <- colnames(flow_set)
+
+# Create and apply arcsinh transformation
+transformation <- arcsinhTransform()
+transform_list <- transformList(from = marker_names, tfun = transformation)
+transformed_flowset <- transform_list %on% flow_set
+```
+
+---
+
+# 4. Data Consolidation
+
+Combine all samples into a single data frame for analysis.
+
+```{r data-consolidation}
+# Combine all samples into a single data frame
+data <- data.frame()
+
+for (i in seq_along(transformed_flowset)) {
+  # Extract and clean sample name
+  sample_name <- basename(fcs_files)[i]
+  sample_name <- gsub("\\.fcs$", "", sample_name)
+  
+  # Extract expression data
+  sample_data <- data.frame(exprs(transformed_flowset[[i]]))
+  sample_data$sample <- sample_name
+  
+  # Combine
+  data <- rbind(data, sample_data)
+}
+
+# Rename columns with marker names
+markernames_vec <- markernames(transformed_flowset)
+colnames(data) <- c("Time", markernames_vec, "sample")
+
+# Display unique conditions
+conditions <- unique(substr(data$sample, 1, 5))
+cat("Unique conditions:", paste(conditions, collapse = ", "), "\n")
+```
+
+# 5. Data Preprocessing
+
+```{r markers-definition}
+markers_cytokines <- c(
+  "IL1a", "IFNa", "IL4", "IFNg",
+  "IL6", "IL8", "IL10", "IL12",
+  "IP10", "MCP1", "Mip1b", "TNFa"
+)
+
+markers_clustering <- c(
+  # Chemokine receptors
+  "CCR5", "CCR7", "CXCR4",
+  
+  # CD11 family
+  "CD11c", "CD11a", "CD11b",
+  
+  # Fc receptors / activation
+  "CD64", "CD23", "CD32", "CD16", "CD86",
+  
+  # Lineage
+  "CD123", "CD45", "CD20", "CD14",
+  "CD4", "CD3", "CD66", "CD8",
+  
+  # Antigen presentation
+  "HLADR"
+)
+```
+
+---
+
+# 7. CellVizR Analysis Pipeline
+
+```{r cellvizr-import}
+# Define markers to exclude from CellVizR analysis
+exclude_markers <- c(
+  # Technical / beads / DNA
+  "Time", "Cell_length", 
+  "(Rh103)Di", "(Xe131)Di", "(Cs133)Di", "(La139)Di",  
+  "(Ce140)Di", "(Gd155)Di", "(Yb173)Di", "(Lu176)Di", 
+  "(Ir191)Di", "(Ir193)Di",
+  "density", "cluster",
+  "IL1a", "IFNa", "IL4", "IFNg",
+  "IL6", "IL8", "IL10", "IL12",
+  "IP10", "MCP1", "Mip1b", "TNFa", "CD3", "CD8", "CD20", "CD4"
+)
+
+
+DataCell <- import(
+  fcs_files,
+  filetype = "fcs",
+  transform = "arcsinh",
+  exclude.markers = exclude_markers,
+  d.method = "uniform",
+  parameters.method = list("target.percent" = 0.2)
+)
+```
+
+---
+
+# 8. Metadata Preparation
+
+```{r metadata-creation}
+metadata <- data.frame(
+  individual = sapply(strsplit(gsub("\\.fcs$", "", basename(fcs_files)), "_"), `[`, 2),
+  condition = ifelse(grepl("^PBD", gsub("\\.fcs$", "", basename(fcs_files))),
+                     "Post-Boost", "Post-Prime"),
+  timepoint_full = sapply(strsplit(gsub("\\.fcs$", "", basename(fcs_files)), "_"), `[`, 1),
+  stringsAsFactors = FALSE
+)
+
+# Extraire UNIQUEMENT le jour (nombre après PBD ou PPD)
+# PBD03H00 → 03
+# PPD14H00 → 14
+metadata$timepoint <- as.numeric(gsub("P[PB]D([0-9]+)H.*", "\\1", metadata$timepoint_full))
+
+# Les rownames doivent être **exactement** les noms des samples FCS importés
+rownames(metadata) <- gsub("\\.fcs$", "", basename(fcs_files))
+
+metadata
+```
+
+```{r}
+metadata_cellvizr <- data.frame(
+  individual = metadata$individual,
+  condition = metadata$condition,
+  timepoint = metadata$timepoint,
+  row.names = rownames(metadata)
+)
+
+metadata_cellvizr
+```
+
+
+
+```{r metadata-assignment}
+DataCell <- assignMetadata(
+  DataCell,
+  metadata = metadata_cellvizr
+)
+```
+
+
+
+# 9. Manifold Generation and Clustering
+
+
+```{r umap-generation}
+# Generate UMAP manifold
+DataCell <- generateManifold(
+  DataCell,
+  method = "UMAP"
+)
+```
+
+```{r}
+# Clustering computation from the manifold 
+DataCell <- identifyClusters(DataCell, 
+                             space = "manifold", 
+                             method = "kmeans", 
+                             centers = 50, 
+                             nstart = 3)
+```
+
+# PCA
+
+```{r}
+
+# 1. PRÉPARER LES DONNÉES
+sample_abundance <- DataCell@matrix.abundance %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("sample") %>%
+  left_join(metadata %>% rownames_to_column("sample"), by = "sample")
+
+# 2. PCA GLOBALE
+abundance_matrix <- sample_abundance %>% 
+  select(-sample, -individual, -condition, -timepoint, -timepoint_full) %>%
+  as.matrix()
+
+pca_result <- prcomp(abundance_matrix, scale. = TRUE, center = TRUE)
+
+# 3. EXTRAIRE COORDONNÉES
+pca_data <- data.frame(
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  sample = sample_abundance$sample,
+  condition = sample_abundance$condition,
+  timepoint = sample_abundance$timepoint,
+  individual = sample_abundance$individual
+)
+
+# 4. VARIANCE EXPLIQUÉE
+variance_explained <- round(100 * summary(pca_result)$importance[2, 1:2], 1)
+
+# 5. PLOT AVEC AXES EN GRAS
+p_pca_bold <- ggplot(pca_data, 
+                     aes(x = PC1, y = PC2, 
+                         color = condition, 
+                         shape = as.factor(timepoint))) +
+
+  # Points
+  geom_point(size = 4, alpha = 0.8) +
+  
+  # Ellipses
+  stat_ellipse(aes(group = condition), 
+               level = 0.95, 
+               linetype = "dashed",
+               size = 1) +
+  
+  # Couleurs
+  scale_color_manual(
+    values = c("Post-Prime" = "#E69F00", "Post-Boost" = "#0072B2"),
+    name = "Condition"
+  ) +
+  
+  # Formes
+  scale_shape_manual(
+    values = c("0" = 15, "1" = 16, "3" = 17, "14" = 18),
+    name = "Days",
+    labels = c("Day 0", "Day 1", "Day 3", "Day 14")
+  ) +
+  
+  labs(
+    title = "PCA - Prime vs Boost Over Time",
+    subtitle = paste0("n = ", nrow(pca_data), " samples"),
+    x = paste0("PC1 (", variance_explained[1], "% variance)"),
+    y = paste0("PC2 (", variance_explained[2], "% variance)")
+  ) +
+  
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_line(color = "gray90"),
+    panel.border = element_rect(color = "gray70", fill = NA),
+    legend.box = "vertical",
+    # Texte des axes en gras
+    axis.title.x = element_text(face = "bold", size = 12),
+    axis.title.y = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(face = "bold", size = 10),
+    axis.text.y = element_text(face = "bold", size = 10),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+print(p_pca_bold)
+#ggsave("pca_bold_axes.pdf", p_pca_bold, width = 10, height = 7)
+```
+
+# Cinétique globale des populations
+
+```{r}
+
+# TRANSPOSER matrix.abundance
+abundance <- DataCell@matrix.abundance %>%
+  t() %>%  # ← AJOUTER CETTE LIGNE pour transposer
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "sample")
+
+# Ajouter metadata (version complète avec toutes les colonnes)
+metadata$sample <- rownames(metadata)
+
+abundance_long <- abundance %>%
+  left_join(metadata, by = "sample") %>%
+  pivot_longer(
+    cols = -c(sample, individual, condition, timepoint, timepoint_full),
+    # OU alternative plus explicite :
+    # cols = matches("^[0-9]+$"),  # Sélectionne uniquement les colonnes numériques
+    names_to = "cluster",
+    values_to = "percentage"
+  )
+
+# Calculer moyenne et SEM par condition, timepoint et cluster
+abundance_kinetics <- abundance_long %>%
+  group_by(condition, timepoint, cluster) %>%
+  summarise(
+    n_samples = n(),
+    mean_pct = mean(percentage, na.rm = TRUE),
+    sem = sd(percentage, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+```
+
+
+```{r kinetics-top-clusters}
+# Identifier les clusters les plus abondants (top 10)
+top_clusters <- abundance_long %>%
+  group_by(cluster) %>%
+  summarise(mean_abundance = mean(percentage, na.rm = TRUE)) %>%
+  arrange(desc(mean_abundance)) %>%
+  slice_head(n = 15) %>%
+  pull(cluster)
+
+# Filtrer pour ne garder que les top clusters
+abundance_kinetics_top <- abundance_long %>%
+  filter(cluster %in% top_clusters) %>%
+  group_by(condition, timepoint, cluster) %>%
+  summarise(
+    n_samples = n(),
+    mean_pct = mean(percentage, na.rm = TRUE),
+    sem = sd(percentage, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+```
+## Version 3 : Comparaison Prime vs Boost côte à côte
+
+```{r kinetics-time-windows}
+# Diviser en phases : Early (0-3j), Mid (3-7j), Late (7-28j)
+abundance_phases <- abundance_long %>%
+  mutate(
+    phase = case_when(
+      timepoint <= 3 ~ "Early (0-3d)",
+      timepoint > 3 ~ "Late (14d)"
+    ),
+    phase = factor(phase, levels = c("Early (0-3d)", "Late (14d)"))
+  ) %>%
+  filter(cluster %in% top_clusters) %>%
+  group_by(condition, phase, cluster) %>%
+  summarise(
+    mean_pct = mean(percentage, na.rm = TRUE),
+    sem = sd(percentage, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+p8_phases <- ggplot(abundance_phases,
+                    aes(x = phase,
+                        y = mean_pct,
+                        fill = cluster)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_errorbar(
+    aes(ymin = mean_pct - sem, ymax = mean_pct + sem),
+    position = position_dodge(width = 0.7),
+    width = 0.3
+  ) +
+  facet_wrap(~condition, nrow = 2, scales = "free_y") +
+  labs(
+    title = "Temporal Phases Analysis",
+    subtitle = "Comparing early and late responses",
+    x = "Response Phase",
+    y = "Mean % of Total Cells"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 11)
+  ) + scale_fill_manual(
+  values = c(
+    "#5B8FF9",  # bleu doux
+    "#61DDAA",  # vert doux
+    "#65789B",  # bleu gris
+    "#F6BD16",  # ocre léger
+    "#7262FD",  # violet gris
+    "#78D3F8",  # bleu clair
+    "#9661BC",  # violet doux
+    "#F6903D",  # orange doux
+    "#008685",  # teal désaturé
+    "#F08BB4",  # rose doux
+    "#9CDA7F",  # vert clair pastel
+    "#BFBFBF",  # gris neutre
+    "#C2C8D5",  # gris bleuté
+    "#FFD666",  # jaune pastel
+    "#8C8C8C"   # gris foncé
+  )
+)
+
+
+
+
+ 
+  guides(fill = guide_legend(nrow = 2))
+
+print(p8_phases)
+```
+
+
+```{r kinetics-significant-changes}
+# Calculer le fold-change max pour chaque cluster
+cluster_dynamics <- abundance_long %>%
+  group_by(cluster, condition) %>%
+  summarise(
+    baseline = mean(percentage[timepoint == 0], na.rm = TRUE),
+    peak = max(percentage, na.rm = TRUE),
+    fold_change = peak / (baseline + 0.01),  # +0.01 pour éviter division par 0
+    .groups = "drop"
+  )
+
+# Identifier clusters avec forte dynamique (FC > 2)
+dynamic_clusters <- cluster_dynamics %>%
+  filter(fold_change > 2) %>%
+  pull(cluster) %>%
+  unique()
+
+# Plot uniquement les clusters dynamiques
+abundance_kinetics_dynamic <- abundance_long %>%
+  filter(cluster %in% dynamic_clusters) %>%
+  group_by(condition, timepoint, cluster) %>%
+  summarise(
+    mean_pct = mean(percentage, na.rm = TRUE),
+    sem = sd(percentage, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+```
+
+
+#metacluster
+
+```{r}
+
+extract_metaclusters_from_heatmap <- function(DataCell, hm.exp, n_metaclusters = 6) {
+  
+  # 1. Utiliser l'ordre des clusters de la heatmap
+  cluster_order <- hm.exp$order.clusters
+  
+  # 2. Profils des clusters
+  cluster_profiles <- data.frame(
+    cluster = as.character(DataCell@identify.clusters),  # ← as.character() ajouté
+    DataCell@matrix.expression
+  ) %>%
+    group_by(cluster) %>%
+    summarise(across(everything(), median, na.rm = TRUE))
+  
+  # 3. Clustering (dans le même ordre que heatmap)
+  heatmap_data <- cluster_profiles %>%
+    column_to_rownames("cluster") %>%
+    as.matrix()
+  
+  hclust_result <- hclust(dist(heatmap_data), method = "ward.D2")
+  metaclusters <- cutree(hclust_result, k = n_metaclusters)
+  
+  # 4. Mapping
+  cluster_to_meta <- data.frame(
+    cluster = names(metaclusters),
+    metacluster = paste0("MC", metaclusters)
+  )
+  
+  # 5. Profils des metaclusters
+  metacluster_profiles <- cluster_profiles %>%
+    mutate(cluster = as.character(cluster)) %>%
+    left_join(cluster_to_meta, by = "cluster") %>%
+    group_by(metacluster) %>%
+    summarise(across(-cluster, median, na.rm = TRUE))
+  
+  # 6. Top 5 marqueurs par metacluster
+  top_markers <- metacluster_profiles %>%
+    pivot_longer(-metacluster, names_to = "marker", values_to = "expression") %>%
+    group_by(metacluster) %>%
+    slice_max(expression, n = 17) %>%
+    arrange(metacluster, desc(expression))
+  
+  # 7. Résumé
+  summary_table <- top_markers %>%
+    group_by(metacluster) %>%
+    summarise(
+      top_markers = paste(marker, collapse = " > "),
+      .groups = "drop"
+    ) %>%
+    left_join(
+      cluster_to_meta %>% 
+        group_by(metacluster) %>% 
+        summarise(
+          n_clusters = n(),
+          clusters = paste(cluster, collapse = ", ")
+        ),
+      by = "metacluster"
+    )
+  
+  return(list(
+    cluster_to_metacluster = cluster_to_meta,
+    metacluster_profiles = metacluster_profiles,
+    top_markers = top_markers,
+    summary = summary_table,
+    hclust = hclust_result,
+    cluster_order = cluster_order,
+    cluster_profiles = cluster_profiles    # ← AJOUTER
+  ))
+}
+# 1. Créer la heatmap CellVizR
+hm.exp <- plotHmExpressions(
+  DataCell, 
+  markers = colnames(DataCell@matrix.expression),
+  clusters = unique(DataCell@identify.clusters),
+  metaclusters = 6
+)
+
+gridExtra::grid.arrange(hm.exp)
+
+# 2. Extraire les metaclusters
+meta_results <- extract_metaclusters_from_heatmap(DataCell, hm.exp, n_metaclusters = 6)
+
+cluster_profiles <- meta_results$cluster_profiles
+# 3. Voir les résultats
+print(meta_results$summary)
+
+# 4. Voir les top marqueurs détaillés
+print(meta_results$top_markers)
+```
+
+
+```{r}
+
+# Préparer les données avec le bon ordre
+top_markers_ordered <- meta_results$top_markers %>%
+  mutate(
+    metacluster = factor(metacluster, levels = paste0("MC", 1:6))
+  )
+
+# GRAPHIQUE CORRIGÉ
+p_top_markers <- ggplot(top_markers_ordered,
+                        aes(x = reorder_within(marker, expression, metacluster),  # ← CORRECTION ICI
+                            y = expression,
+                            fill = metacluster)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_x_reordered() +  # ← NÉCESSAIRE avec reorder_within
+  facet_wrap(~metacluster, scales = "free_y", ncol = 2) +
+  scale_fill_manual(
+    values = c(
+      "MC1" = "#9CDA7F",
+      "MC2" = "#78D3F8",
+      "MC3" = "lightpink",
+      "MC4" = "lightgrey",
+      "MC5" = "#FFD666",
+      "MC6" = "#9B59B6"
+    )
+  ) +
+  labs(
+    title = "Top 10 Markers per Metacluster",
+    subtitle = "Markers ranked by median expression within each metacluster",
+    x = "Marker",
+    y = "Median Expression (arcsinh transformed)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 11),
+    panel.spacing = unit(1.5, "lines"),
+    axis.text.y = element_text(size = 8, face = "bold"),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10)
+  )
+
+print(p_top_markers)
+```
+
+
+```{r expr-long-creation}
+# Préparer les métadonnées
+metadata_fixed <- data.frame(
+  sample = rownames(metadata),
+  condition = metadata$condition,
+  timepoint = metadata$timepoint,
+  individual = metadata$individual,
+  stringsAsFactors = FALSE
+)
+
+# Construire expr_long : expression de chaque cellule, par cluster et marqueur
+expr_long <- data.frame(
+  cluster = DataCell@identify.clusters,
+  sample  = DataCell@samples,
+  DataCell@matrix.expression
+) %>%
+  left_join(metadata_fixed, by = "sample") %>%
+  pivot_longer(
+    cols      = -c(cluster, sample, condition, timepoint, individual),
+    names_to  = "marker",
+    values_to = "expression"
+  )
+
+cat("Dimensions expr_long:", nrow(expr_long), "lignes x", ncol(expr_long), "colonnes\n")
+cat("Clusters uniques:", n_distinct(expr_long$cluster), "\n")
+cat("Marqueurs uniques:", n_distinct(expr_long$marker), "\n")
+cat("Conditions:", paste(unique(expr_long$condition), collapse = ", "), "\n")
+```
+
+
+
+#Tests stats
+```{r tests-stats}
+# 2. STATISTIQUES PAR GROUPE
+group_stats <- expr_long %>%
+  group_by(cluster, marker) %>%
+  summarise(
+    n_total      = n(),
+    n_prime      = sum(condition == "Post-Prime", na.rm = TRUE),  # ← corrigé
+    n_boost      = sum(condition == "Post-Boost", na.rm = TRUE),  # ← corrigé
+    n_conditions = n_distinct(condition),
+    has_na       = any(is.na(expression)),
+    .groups = "drop"
+  )
+
+# Groupes avec problèmes
+problems <- group_stats %>%
+  filter(n_conditions < 2 | n_prime < 3 | n_boost < 3)
+
+cat("Groupes problématiques:", nrow(problems), "\n")
+if(nrow(problems) > 0) print(head(problems, 10))
+
+# 3. TESTS STATISTIQUES
+stats_results <- expr_long %>%
+  group_by(cluster, marker) %>%
+  summarise(
+    n_prime    = sum(condition == "Post-Prime", na.rm = TRUE),       # ← corrigé
+    n_boost    = sum(condition == "Post-Boost", na.rm = TRUE),       # ← corrigé
+    mean_prime = mean(expression[condition == "Post-Prime"], na.rm = TRUE),  # ← corrigé
+    mean_boost = mean(expression[condition == "Post-Boost"], na.rm = TRUE),  # ← corrigé
+    p_value = if(n_prime >= 3 & n_boost >= 3 & n_distinct(condition) == 2) {
+      tryCatch(
+        wilcox.test(expression ~ condition, exact = FALSE)$p.value,
+        error = function(e) NA_real_
+      )
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    diff = mean_boost - mean_prime,
+    padj = p.adjust(p_value, method = "BH", n = sum(!is.na(p_value)))
+  )
+
+cat("\n=== RÉSULTATS ===\n")
+cat("Tests effectués:", sum(!is.na(stats_results$p_value)), "\n")
+cat("Tests non effectués:", sum(is.na(stats_results$p_value)), "\n")
+
+significant <- stats_results %>%
+  filter(!is.na(padj), padj < 0.05) %>%
+  arrange(padj)
+
+cat("Différences significatives (FDR < 0.05):", nrow(significant), "\n\n")
+print(significant %>% select(cluster, marker, mean_prime, mean_boost, diff, p_value, padj) %>% head(20))
+```
+
+
+```{r}
+# 1. VOIR LES TOP RÉSULTATS
+cat("=== TOP 20 DIFFÉRENCES ===\n")
+top_20 <- significant %>%
+  arrange(padj) %>%
+  head(20) %>%
+  select(cluster, marker, mean_prime, mean_boost, diff, p_value, padj)
+
+print(top_20)
+
+# 2. QUELS MARQUEURS SONT LE PLUS SOUVENT SIGNIFICATIFS ?
+marker_summary <- significant %>%
+  group_by(marker) %>%
+  summarise(
+    n_clusters_affected = n(),
+    mean_diff = mean(diff, na.rm = TRUE),
+    median_diff = median(diff, na.rm = TRUE),
+    max_diff = max(abs(diff), na.rm = TRUE)
+  ) %>%
+  arrange(desc(n_clusters_affected))
+
+cat("\n=== MARQUEURS LES PLUS AFFECTÉS ===\n")
+print(marker_summary)
+
+# 3. QUELS CLUSTERS SONT LE PLUS AFFECTÉS ?
+cluster_summary <- significant %>%
+  group_by(cluster) %>%
+  summarise(
+    n_markers_affected = n(),
+    markers = paste(marker, collapse = ", ")
+  ) %>%
+  arrange(desc(n_markers_affected))
+
+cat("\n=== CLUSTERS LES PLUS AFFECTÉS ===\n")
+print(head(cluster_summary, 20))
+```
+
+
+
+
+#Volcano plot
+
+
+```{r}
+# ==============================================================================
+# VOLCANO PLOT AVEC METACLUSTERS SYNCHRONISÉS
+# ==============================================================================
+
+# 1. UTILISER LE MAPPING DÉJÀ EXTRAIT DE LA HEATMAP
+# (au lieu de refaire un clustering indépendant)
+cluster_to_meta <- meta_results$cluster_to_metacluster
+
+# 2. EXTRAIRE TOP 3 MARQUEURS PAR METACLUSTER (depuis meta_results)
+top_markers_per_meta <- meta_results$top_markers %>%
+  group_by(metacluster) %>%
+  slice_max(expression, n = 3) %>%
+  summarise(
+    top3_markers = paste(marker, collapse = ", "),
+    .groups = "drop"
+  )
+
+# 3. CRÉER ANNOTATIONS COMPLÈTES
+metacluster_annotations <- data.frame(
+  metacluster = c("MC1", "MC2", "MC3", "MC4", "MC5", "MC6"),
+  cell_type = c(
+    "APC",
+    "Neutrophils 2",
+    "Neutrophils 3",
+    "Monocytes",
+    "Neutrophils 4",
+    "Neutrophils 1"
+  ),
+  short_name = c(
+    "Neutro.1",
+    "Neutro.2",
+    "Neutro.3",
+    "Monocytes",
+    "Neutro.4",
+    "APC"
+  )
+) %>%
+  left_join(top_markers_per_meta, by = "metacluster")
+
+# 4. TESTS STATISTIQUES SUR ABONDANCE
+cluster_abundance_stats <- abundance_long %>%
+  group_by(cluster) %>%
+  summarise(
+    n_prime = sum(condition == "Post-Prime", na.rm = TRUE),
+    n_boost = sum(condition == "Post-Boost", na.rm = TRUE),
+    mean_prime = mean(percentage[condition == "Post-Prime"], na.rm = TRUE),
+    mean_boost = mean(percentage[condition == "Post-Boost"], na.rm = TRUE),
+    
+    p_value = if(n_prime >= 3 & n_boost >= 3) {
+      tryCatch(
+        wilcox.test(percentage ~ condition, exact = FALSE)$p.value,
+        error = function(e) NA_real_
+      )
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    diff = mean_boost - mean_prime,
+    padj = p.adjust(p_value, method = "BH", n = sum(!is.na(p_value)))
+  )
+
+# 5. AJOUTER METACLUSTERS + ANNOTATIONS
+# ⚠️ UTILISER cluster_to_meta DE meta_results au lieu de refaire le clustering
+cluster_abundance_stats <- cluster_abundance_stats %>%
+  mutate(cluster = as.character(cluster)) %>%  # S'assurer du bon type
+  left_join(cluster_to_meta, by = "cluster") %>%
+  left_join(metacluster_annotations, by = "metacluster")
+
+# 6. PRÉPARER VOLCANO AVEC DIRECTION
+volcano_clusters <- cluster_abundance_stats %>%
+  filter(!is.na(p_value)) %>%
+  mutate(
+    neg_log10_padj = -log10(padj),
+    significant = !is.na(padj) & padj < 0.05,
+    direction = case_when(
+      significant & diff > 0 ~ "Higher in Boost",
+      significant & diff < 0 ~ "Higher in Prime",
+      TRUE ~ "Not significant"
+    ),
+    direction = factor(direction, levels = c("Higher in Boost", "Higher in Prime", "Not significant")),
+    # Ordonner les metaclusters
+    metacluster = factor(metacluster, levels = paste0("MC", 1:6))
+  )
+
+# 7. TOP CLUSTERS À LABELER (top 2 par metacluster pour éviter surcharge)
+top_clusters_labeled <- volcano_clusters %>%
+  filter(significant) %>%
+  group_by(metacluster) %>%
+  slice_max(abs(diff), n = 2) %>%
+  ungroup()
+
+# 8. VOLCANO PLOT FINAL
+p_volcano_final <- ggplot(volcano_clusters,
+                          aes(x = diff, y = neg_log10_padj, 
+                              color = metacluster,
+                              fill = metacluster,
+                              shape = direction)) +
+  
+  # Points avec tailles différentes
+  geom_point(aes(size = ifelse(significant, 4, 2)), alpha = 0.8, stroke = 0.5) +
+  
+  # Lignes de seuil
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "solid", color = "gray50") +
+  
+  # LABELS
+  geom_text_repel(
+    data = top_clusters_labeled,
+    aes(label = paste0("C", cluster, "\n", short_name)),
+    size = 3.5,
+    fontface = "bold",
+    max.overlaps = Inf,
+    box.padding = 0.8,
+    segment.color = "gray40",
+    show.legend = FALSE
+  ) +
+  
+  # COULEURS PAR METACLUSTER (synchronisées avec la heatmap)
+  scale_color_manual(
+    values = c(
+      "MC1" = "#9CDA7F",
+      "MC2" = "#78D3F8",
+      "MC3" = "lightpink",
+      "MC4" = "lightgrey",
+      "MC5" = "#FFD666",
+      "MC6" = "#9B59B6"
+    ),
+    labels = setNames(
+      paste0(
+        levels(volcano_clusters$metacluster), ": ",
+        metacluster_annotations$cell_type,
+        "\n(", metacluster_annotations$top3_markers, ")"
+      ),
+      levels(volcano_clusters$metacluster)
+    ),
+    name = "Metacluster Phenotype",
+    drop = FALSE  # Garder tous les niveaux même si absents
+  ) +
+  
+  scale_fill_manual(
+    values = c(
+      "MC1" = "#9CDA7F",
+      "MC2" = "#78D3F8",
+      "MC3" = "lightpink",
+      "MC4" = "lightgrey",
+      "MC5" = "#FFD666",
+      "MC6" = "#9B59B6"
+    ),
+    guide = "none"
+  ) +
+  
+  # FORMES PAR DIRECTION
+  scale_shape_manual(
+    values = c(
+      "Higher in Boost" = 24,
+      "Higher in Prime" = 25,
+      "Not significant" = 21
+    ),
+    name = "Direction"
+  ) +
+  
+  scale_size_identity() +
+  
+  labs(
+    title = "Volcano Plot - Cluster Abundance: Boost vs Prime",
+    subtitle = paste0(sum(volcano_clusters$significant), 
+                     " significant clusters (FDR < 0.05)"),
+    x = "Difference in % Abundance (Boost - Prime)",
+    y = "-Log10(adjusted p-value)"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 9, lineheight = 1.2),
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.key.height = unit(1.2, "cm"),
+    legend.box = "vertical",
+    panel.border = element_rect(color = "gray70", fill = NA),
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold", size = 12)
+  ) +
+  
+  # Organiser les légendes
+  guides(
+    color = guide_legend(
+      order = 1,
+      override.aes = list(
+        size = 5, 
+        shape = 21, 
+        fill = c("#9CDA7F", "#78D3F8", "lightpink", "lightgrey", "#FFD666", "#9B59B6")
+      )
+    ),
+    shape = guide_legend(
+      order = 2,
+      override.aes = list(size = 5, fill = "gray30", color = "gray30")
+    )
+  )
+
+print(p_volcano_final)
+
+# ==============================================================================
+# VÉRIFICATION DE LA SYNCHRONISATION
+# ==============================================================================
+
+cat("\n=== VÉRIFICATION METACLUSTERS ===\n")
+cat("Metaclusters dans heatmap:", paste(unique(meta_results$cluster_to_metacluster$metacluster), collapse = ", "), "\n")
+cat("Metaclusters dans volcano:", paste(unique(volcano_clusters$metacluster), collapse = ", "), "\n")
+
+# Comparer les clusters par metacluster
+comparison <- meta_results$cluster_to_metacluster %>%
+  arrange(metacluster, cluster) %>%
+  group_by(metacluster) %>%
+  summarise(
+    clusters_heatmap = paste(sort(cluster), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    volcano_clusters %>%
+      filter(!is.na(metacluster)) %>%
+      arrange(metacluster, cluster) %>%
+      group_by(metacluster) %>%
+      summarise(
+        clusters_volcano = paste(sort(unique(cluster)), collapse = ", "),
+        .groups = "drop"
+      ),
+    by = "metacluster"
+  )
+
+cat("\n=== COMPARAISON CLUSTERS PAR METACLUSTER ===\n")
+print(comparison)
+
+# 9. RÉSUMÉS
+cat("\n=== RÉSUMÉ PAR DIRECTION ===\n")
+direction_summary <- volcano_clusters %>%
+  filter(significant) %>%
+  group_by(direction) %>%
+  summarise(n = n(), .groups = "drop")
+print(direction_summary)
+
+cat("\n=== RÉSUMÉ PAR METACLUSTER ===\n")
+metacluster_summary <- volcano_clusters %>%
+  filter(significant) %>%
+  group_by(metacluster, cell_type) %>%
+  summarise(
+    n_clusters = n(),
+    n_boost = sum(direction == "Higher in Boost", na.rm = TRUE),
+    n_prime = sum(direction == "Higher in Prime", na.rm = TRUE),
+    .groups = "drop"
+  )
+print(metacluster_summary)
+
+# ==============================================================================
+# TABLEAU RÉCAPITULATIF PAR METACLUSTER
+# ==============================================================================
+
+metacluster_detail <- volcano_clusters %>%
+  group_by(metacluster, cell_type) %>%
+  summarise(
+    n_total_clusters = n(),
+    n_significant = sum(significant, na.rm = TRUE),
+    mean_diff = mean(diff, na.rm = TRUE),
+    clusters_list = paste(unique(cluster), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  left_join(top_markers_per_meta, by = "metacluster") %>%
+  arrange(metacluster)
+
+cat("\n=== DÉTAIL PAR METACLUSTER ===\n")
+print(metacluster_detail)
+```
+
+
+
+```{r}
+# Display manifold overlay by 'markers'  
+plotManifold(DataCell, 
+             markers = "CD86",
+             samples = NULL,
+             downsampling = 20000)
+```
+
+```{r}
+# Display manifold overlay by 'cluster' 
+plotManifold(DataCell, markers = "clusters", downsampling = 20000) + 
+  ggplot2::guides(color = "none")
+```
+
+
+# Abondance sur clusters apc
+
+
+
+```{r}
+
+# 1. IDENTIFIER LES TOP 10 CLUSTERS PAR SCORE APC
+# ------------------------------------------------
+apc_expression <- cluster_profiles %>%
+  select(cluster, HLADR, CD86) %>%
+  filter(cluster != 48) %>%
+  mutate(
+    # Standardisation des valeurs (z-score : moyenne=0, SD=1)
+    HLADR_scaled = scale(HLADR)[,1],
+    CD86_scaled = scale(CD86)[,1],
+    # Score composite : somme des z-scores
+    apc_score = HLADR_scaled + CD86_scaled
+  ) %>%
+  arrange(desc(apc_score))
+
+cat("\n=== TOP 20 CLUSTERS PAR SCORE APC ===\n")
+print(head(apc_expression, 20))
+
+# MODIFICATION : Prendre les TOP 10 directement (au lieu d'un seuil percentile)
+apc_clusters <- apc_expression %>%
+  slice_head(n = 10) %>%  # TOP 10 CLUSTERS
+  pull(cluster) %>%
+  as.character()
+
+cat("\n=== TOP 10 CLUSTERS APC SÉLECTIONNÉS ===\n")
+cat("Clusters:", paste(apc_clusters, collapse = ", "), "\n")
+
+# Voir leurs scores
+top10_scores <- apc_expression %>%
+  slice_head(n = 10) %>%
+  select(cluster, HLADR, CD86, apc_score)
+
+cat("\nScores des TOP 10:\n")
+print(top10_scores)
+
+# 2. CARACTÉRISATION PHÉNOTYPIQUE
+# --------------------------------
+apc_phenotype_summary <- cluster_profiles %>%
+  filter(cluster %in% apc_clusters) %>%
+  pivot_longer(-cluster, names_to = "marker", values_to = "expression") %>%
+  group_by(cluster) %>%
+  slice_max(expression, n = 5) %>%
+  summarise(top5_markers = paste(marker, collapse = ", "), .groups = "drop")
+
+cat("\n=== TOP 5 MARQUEURS PAR CLUSTER APC ===\n")
+print(apc_phenotype_summary)
+
+# Vérifier leur appartenance aux metaclusters
+apc_meta_assignment <- meta_results$cluster_to_metacluster %>%
+  filter(cluster %in% apc_clusters) %>%
+  left_join(metacluster_annotations, by = "metacluster") %>%
+  arrange(metacluster)
+
+cat("\n=== RÉPARTITION PAR METACLUSTER ===\n")
+print(table(apc_meta_assignment$cell_type))
+
+# ==============================================================================
+# 3. ANALYSE D'ABONDANCE
+# ==============================================================================
+
+apc_abundance <- abundance_long %>%
+  filter(cluster %in% apc_clusters) %>%
+  group_by(sample, condition, timepoint, individual) %>%
+  summarise(
+    total_apc_pct = sum(percentage, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    condition = factor(condition, levels = c("Post-Prime", "Post-Boost")),
+    timepoint = factor(timepoint, levels = c("0", "1", "3", "14"))
+  )
+
+# Test statistique global Prime vs Boost
+wilcox_test_apc <- wilcox.test(total_apc_pct ~ condition, data = apc_abundance)
+
+cat("\n=== TEST GLOBAL ABONDANCE : PRIME VS BOOST ===\n")
+cat("Test de Wilcoxon (non-paramétrique)\n")
+cat("H0 : Les distributions Prime et Boost sont identiques\n")
+cat("p-value:", format(wilcox_test_apc$p.value, scientific = TRUE), "\n")
+if(wilcox_test_apc$p.value < 0.001) {
+  cat("Conclusion : Différence hautement significative (***)\n")
+} else if(wilcox_test_apc$p.value < 0.01) {
+  cat("Conclusion : Différence très significative (**)\n")
+} else if(wilcox_test_apc$p.value < 0.05) {
+  cat("Conclusion : Différence significative (*)\n")
+} else {
+  cat("Conclusion : Pas de différence significative (ns)\n")
+}
+
+summary_apc <- apc_abundance %>%
+  group_by(condition) %>%
+  summarise(
+    n = n(),
+    mean = mean(total_apc_pct),
+    median = median(total_apc_pct),
+    sd = sd(total_apc_pct),
+    .groups = "drop"
+  )
+
+cat("\n=== RÉSUMÉ ABONDANCE ===\n")
+print(summary_apc)
+
+fc_abundance <- summary_apc$mean[2] / summary_apc$mean[1]
+cat("\nFold-change Boost/Prime:", round(fc_abundance, 2), "×\n")
+
+# BOXPLOT ABONDANCE (séparé)
+library(ggpubr)
+
+p_abundance <- ggplot(apc_abundance, 
+                      aes(x = timepoint, y = total_apc_pct, fill = condition)) +
+  geom_boxplot(color = "black", width = 0.7, outlier.shape = NA, alpha = 0.8) +
+  geom_point(position = position_jitterdodge(dodge.width = 0.7, jitter.width = 0.15),
+             color = "black", size = 2, alpha = 0.5) +
+  stat_compare_means(
+    aes(group = condition),
+    method = "wilcox.test",
+    label = "p.signif",
+    size = 7,
+    fontface = "bold",
+    hide.ns = FALSE
+  ) +
+  scale_fill_manual(values = c("Post-Prime" = "skyblue", "Post-Boost" = "#C2C8D5")) +
+  labs(
+    title = "APC Abundance (Top 10 HLADR+ CD86+ Clusters)",
+    subtitle = paste0("Clusters: ", paste(apc_clusters, collapse = ", ")),
+    x = "Days Post-Vaccination",
+    y = "% of Total Cells",
+    fill = "Condition"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 13),
+    axis.text = element_text(face = "bold", color = "black", size = 11),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold", size = 12)
+  )
+
+print(p_abundance)
+
+# ==============================================================================
+# 4. ANALYSE MFI (INTENSITÉ D'EXPRESSION)
+# ==============================================================================
+
+# Préparer métadonnées
+metadata_fixed <- data.frame(
+  sample = rownames(metadata),
+  condition = metadata$condition,
+  timepoint = metadata$timepoint,
+  individual = metadata$individual,
+  stringsAsFactors = FALSE
+)
+
+# Extraire les cellules des TOP 10 clusters APC uniquement
+cell_data <- data.frame(
+  cluster = DataCell@identify.clusters,
+  sample = DataCell@samples,
+  DataCell@matrix.expression
+) %>%
+  left_join(metadata_fixed, by = "sample")
+
+# Calculer MFI UNIQUEMENT sur les cellules des TOP 10 clusters APC
+apc_mfi_data <- cell_data %>%
+  filter(cluster %in% apc_clusters) %>%  # FILTRAGE CRUCIAL
+  group_by(sample, condition, timepoint, individual) %>%
+  summarise(
+    MFI_HLADR = median(HLADR, na.rm = TRUE),
+    MFI_CD86 = median(CD86, na.rm = TRUE),
+    n_cells = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    condition = factor(condition, levels = c("Post-Prime", "Post-Boost")),
+    timepoint = factor(timepoint, levels = c("0", "1", "3", "14"))
+  )
+
+cat("\n=== NOMBRE DE CELLULES APC PAR ÉCHANTILLON ===\n")
+cat("Médiane:", median(apc_mfi_data$n_cells), "\n")
+cat("Range:", min(apc_mfi_data$n_cells), "-", max(apc_mfi_data$n_cells), "\n")
+
+# Format long pour ggplot
+apc_mfi_long <- apc_mfi_data %>%
+  pivot_longer(
+    cols = c(MFI_HLADR, MFI_CD86),
+    names_to = "marker",
+    values_to = "intensity"
+  ) %>%
+  mutate(
+    marker = recode(marker, 
+                    "MFI_HLADR" = "HLA-DR",
+                    "MFI_CD86" = "CD86"),
+    marker = factor(marker, levels = c("HLA-DR", "CD86"))
+  )
+
+# Tests statistiques par marqueur
+cat("\n=== TESTS MFI PAR MARQUEUR ===\n")
+for(m in c("HLA-DR", "CD86")) {
+  test <- wilcox.test(intensity ~ condition, 
+                      data = filter(apc_mfi_long, marker == m))
+  cat(m, ":\n")
+  cat("  p-value:", format(test$p.value, scientific = TRUE), "\n")
+  if(test$p.value < 0.001) {
+    cat("  Conclusion : Différence hautement significative (***)\n")
+  } else if(test$p.value < 0.01) {
+    cat("  Conclusion : Différence très significative (**)\n")
+  } else if(test$p.value < 0.05) {
+    cat("  Conclusion : Différence significative (*)\n")
+  } else {
+    cat("  Conclusion : Pas de différence significative (ns)\n")
+  }
+}
+
+# BOXPLOT MFI (HLA-DR et CD86 côte à côte)
+p_mfi <- ggplot(apc_mfi_long, 
+                aes(x = timepoint, y = intensity, fill = condition)) +
+  geom_boxplot(color = "black", width = 0.7, outlier.shape = NA, alpha = 0.8) +
+  geom_point(position = position_jitterdodge(dodge.width = 0.7, jitter.width = 0.15),
+             color = "black", size = 1.5, alpha = 0.4) +
+  stat_compare_means(
+    aes(group = condition),
+    method = "wilcox.test",
+    label = "p.signif",
+    size = 7,
+    fontface = "bold",
+    hide.ns = FALSE
+  ) +
+  facet_wrap(~marker, scales = "free_y", ncol = 2) +  # CÔTE À CÔTE
+  scale_fill_manual(values = c("Post-Prime" = "skyblue", "Post-Boost" = "#C2C8D5")) +
+  labs(
+    title = "Activation Markers Intensity (MFI)",
+    subtitle = paste0("Top 10 APC clusters: ", paste(apc_clusters, collapse = ", ")),
+    x = "Days Post-Vaccination",
+    y = "Median Fluorescence Intensity (arcsinh)",
+    fill = "Condition"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 13),
+    axis.text = element_text(face = "bold", color = "black", size = 11),
+    strip.text = element_text(face = "bold", size = 13),
+    strip.background = element_rect(fill = "gray95"),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold", size = 12)
+  )
+
+print(p_mfi)
+
+
+# ==============================================================================
+# 6. RÉSUMÉ FINAL
+# ==============================================================================
+
+cat("\n")
+cat("======================================================\n")
+cat("     RÉSUMÉ ANALYSE TOP 10 CLUSTERS APC\n")
+cat("======================================================\n\n")
+
+cat("SÉLECTION DES CLUSTERS:\n")
+cat("- Méthode : Top 10 clusters par score APC (z-score HLADR + z-score CD86)\n")
+cat("- Clusters sélectionnés:", paste(apc_clusters, collapse = ", "), "\n\n")
+
+cat("MÉTACLUSTERS REPRÉSENTÉS:\n")
+print(table(apc_meta_assignment$cell_type))
+cat("\n")
+
+cat("ABONDANCE:\n")
+cat("- Moyenne Prime:", round(summary_apc$mean[1], 2), "%\n")
+cat("- Moyenne Boost:", round(summary_apc$mean[2], 2), "%\n")
+cat("- Fold-change:", round(fc_abundance, 2), "×\n")
+cat("- p-value (Wilcoxon):", format(wilcox_test_apc$p.value, scientific = TRUE), "\n\n")
+
+cat("MFI (calculée uniquement sur les cellules des TOP 10 clusters):\n")
+mfi_summary <- apc_mfi_long %>%
+  group_by(condition, marker) %>%
+  summarise(mean_intensity = mean(intensity), .groups = "drop")
+print(mfi_summary)
+
+cat("\n======================================================\n")
+```
+
+
+#analyses metacluster 1 
+
+```{r}
+# ==============================================================================
+# ANALYSE CIBLÉE METACLUSTER 1 (APCs)
+# ==============================================================================
+
+# 1. IDENTIFIER LES CLUSTERS DU METACLUSTER 1
+# --------------------------------------------
+mc1_clusters <- meta_results$cluster_to_metacluster %>%
+  filter(metacluster == "MC1") %>%
+  pull(cluster) %>%
+  as.character()
+
+cat("=== METACLUSTER 1 (APCs) ===\n")
+cat("Nombre de clusters:", length(mc1_clusters), "\n")
+cat("Clusters:", paste(mc1_clusters, collapse = ", "), "\n\n")
+
+# Voir le phénotype
+mc1_phenotype <- meta_results$top_markers %>%
+  filter(metacluster == "MC1") %>%
+  arrange(desc(expression))
+
+cat("Top marqueurs MC1:\n")
+print(mc1_phenotype)
+
+# ==============================================================================
+# 2. ANALYSE D'ABONDANCE
+# ==============================================================================
+
+# Calculer l'abondance totale du MC1 par échantillon
+mc1_abundance <- abundance_long %>%
+  filter(cluster %in% mc1_clusters) %>%
+  group_by(sample, condition, timepoint, individual) %>%
+  summarise(
+    total_mc1_pct = sum(percentage, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    condition = factor(condition, levels = c("Post-Prime", "Post-Boost")),
+    timepoint = factor(timepoint, levels = c("0", "1", "3", "14"))
+  )
+
+# Test global Prime vs Boost
+cat("\n=== TEST ABONDANCE MC1: PRIME VS BOOST ===\n")
+wilcox_abundance <- wilcox.test(total_mc1_pct ~ condition, data = mc1_abundance)
+print(wilcox_abundance)
+
+# Résumé par condition
+summary_abundance <- mc1_abundance %>%
+  group_by(condition) %>%
+  summarise(
+    n = n(),
+    mean_pct = mean(total_mc1_pct),
+    median_pct = median(total_mc1_pct),
+    sd = sd(total_mc1_pct),
+    .groups = "drop"
+  )
+
+cat("\nRésumé abondance:\n")
+print(summary_abundance)
+
+fc_abundance <- summary_abundance$mean_pct[summary_abundance$condition == "Post-Boost"] / 
+                summary_abundance$mean_pct[summary_abundance$condition == "Post-Prime"]
+cat("\nFold-change Boost/Prime:", round(fc_abundance, 2), "×\n")
+
+# Tests par timepoint
+cat("\n=== TESTS PAR TIMEPOINT ===\n")
+timepoint_tests <- mc1_abundance %>%
+  group_by(timepoint) %>%
+  summarise(
+    n_prime = sum(condition == "Post-Prime"),
+    n_boost = sum(condition == "Post-Boost"),
+    p_value = if(n_prime >= 3 & n_boost >= 3) {
+      wilcox.test(total_mc1_pct ~ condition)$p.value
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    significance = case_when(
+      is.na(p_value) ~ "N/A",
+      p_value < 0.001 ~ "***",
+      p_value < 0.01 ~ "**",
+      p_value < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+print(timepoint_tests)
+
+# ==============================================================================
+# 3. ANALYSE MFI (INTENSITÉ D'EXPRESSION)
+# ==============================================================================
+
+# Préparer les données cellulaires avec métadonnées
+metadata_fixed <- data.frame(
+  sample = rownames(metadata),
+  condition = metadata$condition,
+  timepoint = metadata$timepoint,
+  individual = metadata$individual,
+  stringsAsFactors = FALSE
+)
+
+# Extraire les cellules du MC1 uniquement
+mc1_cell_data <- data.frame(
+  cluster = DataCell@identify.clusters,
+  sample = DataCell@samples,
+  DataCell@matrix.expression
+) %>%
+  filter(cluster %in% mc1_clusters) %>%
+  left_join(metadata_fixed, by = "sample")
+
+# Calculer MFI par échantillon (médiane des cellules MC1 dans chaque échantillon)
+mc1_mfi_data <- mc1_cell_data %>%
+  group_by(sample, condition, timepoint, individual) %>%
+  summarise(
+    MFI_HLADR = median(HLADR, na.rm = TRUE),
+    MFI_CD86 = median(CD86, na.rm = TRUE),
+    n_cells = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    condition = factor(condition, levels = c("Post-Prime", "Post-Boost")),
+    timepoint = factor(timepoint, levels = c("0", "1", "3", "14"))
+  )
+
+# Tests MFI globaux
+cat("\n=== TESTS MFI MC1: PRIME VS BOOST ===\n")
+
+cat("HLA-DR:\n")
+test_hladr <- wilcox.test(MFI_HLADR ~ condition, data = mc1_mfi_data)
+print(test_hladr)
+
+cat("\nCD86:\n")
+test_cd86 <- wilcox.test(MFI_CD86 ~ condition, data = mc1_mfi_data)
+print(test_cd86)
+
+# Format long pour ggplot (uniquement HLA-DR et CD86)
+mc1_mfi_long <- mc1_mfi_data %>%
+  pivot_longer(
+    cols = c(MFI_HLADR, MFI_CD86),
+    names_to = "marker",
+    values_to = "intensity"
+  ) %>%
+  mutate(
+    marker = recode(marker,
+                    "MFI_HLADR" = "HLA-DR",
+                    "MFI_CD86" = "CD86"),
+    marker = factor(marker, levels = c("HLA-DR", "CD86"))
+  )
+
+# ==============================================================================
+# 4. VISUALISATIONS
+# ==============================================================================
+
+library(ggpubr)
+
+# A. BOXPLOT ABONDANCE
+p_mc1_abundance <- ggplot(mc1_abundance, 
+                          aes(x = timepoint, y = total_mc1_pct, fill = condition)) +
+  geom_boxplot(color = "black", width = 0.7, outlier.shape = NA, alpha = 0.8) +
+  geom_point(position = position_jitterdodge(dodge.width = 0.7, jitter.width = 0.15),
+             color = "black", size = 2, alpha = 0.5) +
+  stat_compare_means(
+    aes(group = condition),
+    method = "wilcox.test",
+    label = "p.signif",
+    size = 7,
+    fontface = "bold",
+    hide.ns = FALSE
+  ) +
+  scale_fill_manual(values = c("Post-Prime" = "skyblue", "Post-Boost" = "#C2C8D5")) +
+  scale_y_continuous(limits = c(0, 3), breaks = seq(0, 3, 0.5)) +  # ÉCHELLE 0-3
+  labs(
+    title = "Metacluster 1 (APCs) - Abundance Over Time",
+    subtitle = paste0("Clusters: ", paste(mc1_clusters, collapse = ", ")),
+    x = "Days Post-Vaccination",
+    y = "% of Total Cells",
+    fill = "Condition"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 13),
+    axis.text = element_text(face = "bold", color = "black", size = 11),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+print(p_mc1_abundance)
+
+# B. BOXPLOT MFI (HLA-DR et CD86 côte à côte)
+p_mc1_mfi <- ggplot(mc1_mfi_long, 
+                    aes(x = timepoint, y = intensity, fill = condition)) +
+  geom_boxplot(color = "black", width = 0.7, outlier.shape = NA, alpha = 0.8) +
+  geom_point(position = position_jitterdodge(dodge.width = 0.7, jitter.width = 0.15),
+             color = "black", size = 1.5, alpha = 0.4) +
+  stat_compare_means(
+    aes(group = condition),
+    method = "wilcox.test",
+    label = "p.signif",
+    size = 7,
+    fontface = "bold",
+    hide.ns = FALSE
+  ) +
+  facet_wrap(~marker, scales = "free_y", ncol = 2) +  # CÔTE À CÔTE
+  scale_fill_manual(values = c("Post-Prime" = "skyblue", "Post-Boost" = "#C2C8D5")) +
+  labs(
+    title = "Metacluster 1 (APCs) - Activation Markers Intensity",
+    subtitle = paste0("Clusters: ", paste(mc1_clusters, collapse = ", ")),
+    x = "Days Post-Vaccination",
+    y = "Median Fluorescence Intensity (arcsinh)",
+    fill = "Condition"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 13),
+    axis.text = element_text(face = "bold", color = "black", size = 10),
+    strip.text = element_text(face = "bold", size = 12),
+    strip.background = element_rect(fill = "gray95"),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold", size = 12)
+  )
+
+print(p_mc1_mfi)
+
+# C. CINÉTIQUE (LIGNE)
+mc1_kinetics <- mc1_abundance %>%
+  group_by(condition, timepoint) %>%
+  summarise(
+    mean_pct = mean(total_mc1_pct),
+    sem = sd(total_mc1_pct) / sqrt(n()),
+    .groups = "drop"
+  )
+
+p_mc1_kinetics <- ggplot(mc1_kinetics,
+                         aes(x = as.numeric(as.character(timepoint)),
+                             y = mean_pct,
+                             color = condition,
+                             group = condition)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = mean_pct - sem, ymax = mean_pct + sem),
+                width = 0.5, linewidth = 1) +
+  scale_fill_manual(values = c("Post-Prime" = "skyblue", "Post-Boost" = "#C2C8D5")) +
+  scale_x_continuous(breaks = c(0, 1, 3, 14)) +
+  labs(
+    title = "Metacluster 1 (APCs) - Kinetics",
+    subtitle = "Mean ± SEM",
+    x = "Days Post-Vaccination",
+    y = "% of Total Cells",
+    color = "Condition"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 13),
+    axis.text = element_text(face = "bold", size = 11),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "gray70", fill = NA)
+  )
+
+print(p_mc1_kinetics)
+
+# ==============================================================================
+# 6. RÉSUMÉ FINAL
+# ==============================================================================
+
+cat("\n")
+cat("======================================================\n")
+cat("     RÉSUMÉ METACLUSTER 1 (APCs)\n")
+cat("======================================================\n\n")
+
+cat("COMPOSITION:\n")
+cat("- Nombre de clusters:", length(mc1_clusters), "\n")
+cat("- Clusters:", paste(mc1_clusters, collapse = ", "), "\n\n")
+
+cat("MARQUEURS CARACTÉRISTIQUES:\n")
+top3 <- head(mc1_phenotype$marker, 3)
+cat("- Top 3:", paste(top3, collapse = ", "), "\n\n")
+
+cat("ABONDANCE:\n")
+cat("- Moyenne Prime:", round(summary_abundance$mean_pct[1], 2), "%\n")
+cat("- Moyenne Boost:", round(summary_abundance$mean_pct[2], 2), "%\n")
+cat("- Fold-change:", round(fc_abundance, 2), "×\n")
+cat("- p-value:", format(wilcox_abundance$p.value, scientific = TRUE), "\n\n")
+
+cat("INTENSITÉ (MFI):\n")
+cat("- HLA-DR p-value:", format(test_hladr$p.value, scientific = TRUE), "\n")
+cat("- CD86 p-value:", format(test_cd86$p.value, scientific = TRUE), "\n\n")
+
+cat("SIGNIFICATIVITÉ PAR TIMEPOINT:\n")
+print(timepoint_tests)
+
+cat("\n======================================================\n")
+```
+
+
+
+
+
+
+
+
+-
